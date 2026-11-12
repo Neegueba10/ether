@@ -1,0 +1,108 @@
+package app
+
+import (
+	"context"
+	"strings"
+	"time"
+
+	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/playback"
+)
+
+// Owner status presents one row per viewer, including passthrough IPTV.
+// Programme sources stay private to the playout service.
+type ownerPlayback struct {
+	core.Playback
+	app *App
+}
+
+func (p ownerPlayback) Sessions() []*core.PlaySession {
+	out := p.localSessions()
+	// Other cluster nodes' streams (nil on a standalone server).
+	if p.app != nil && p.app.playback != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		for _, s := range p.app.playback.RemoteSessions(ctx) {
+			if !s.PreparedOnly && !liveProgrammeSource(s) {
+				out = append(out, s)
+			}
+		}
+		cancel()
+	}
+	return out
+}
+
+// localSessions is this node's share of Sessions: in-memory snapshots only,
+// no cluster calls, so the console stream can watch it cheaply.
+func (p ownerPlayback) localSessions() []*core.PlaySession {
+	var live []*core.PlaySession
+	if p.app != nil && p.app.livetv != nil {
+		live = p.app.livetv.ViewingSessions()
+	}
+	groups := map[string]bool{}
+	for _, s := range live {
+		groups[s.ID] = true
+	}
+	out := make([]*core.PlaySession, 0, len(live))
+	backend := p.Playback
+	if p.app != nil {
+		if p.app.brokerPlayback != nil {
+			backend = p.app.brokerPlayback
+		} else if p.app.spikeLibrary != nil {
+			backend = p.app.spikeLibrary.Playback()
+		}
+	}
+	if manager, ok := backend.(*playback.Manager); ok && manager == nil {
+		backend = nil
+	}
+	var local []*core.PlaySession
+	if backend != nil {
+		local = backend.Sessions()
+	}
+	for _, s := range local {
+		if s.PreparedOnly || (s.PlaybackGroup != "" && groups[s.PlaybackGroup]) || liveProgrammeSource(s) {
+			continue
+		}
+		out = append(out, s)
+	}
+	return append(out, live...)
+}
+
+// liveProgrammeSource recognises the source a Live TV channel opens to feed its
+// broadcast (the programme it is airing). It belongs to the channel's viewing
+// row, not to a viewer of its own, even when the backend could not group it.
+func liveProgrammeSource(s *core.PlaySession) bool {
+	return strings.HasPrefix(s.ClientID, "channel-input/") || strings.HasPrefix(s.Client.ClientID, "channel-input/")
+}
+
+func (p ownerPlayback) Session(id string) (*core.PlaySession, bool) {
+	for _, s := range p.Sessions() {
+		if s.ID == id {
+			return s, true
+		}
+	}
+	return nil, false
+}
+
+func (a *App) stopOwnerSession(id string) error {
+	a.frontends.noteOwnerStop(id, "The server owner has ended this stream.")
+	if a.frontends != nil && a.frontends.broker != nil {
+		a.frontends.broker.StopPlayback(context.Background(), id)
+	}
+	if a.livetv != nil {
+		for _, s := range a.livetv.ViewingSessions() {
+			if s.ID == id {
+				return a.livetv.Stop(context.Background(), id, &core.User{IsOwner: true})
+			}
+		}
+	}
+	// Broker retirement can leave the source on the owner list. The named
+	// session still has to stop.
+	if a.brokerPlayback != nil {
+		a.brokerPlayback.Stop(id)
+	} else if a.spikeLibrary != nil {
+		a.spikeLibrary.Playback().Stop(id)
+	} else if a.playback != nil {
+		a.playback.Stop(id)
+	}
+	return nil
+}

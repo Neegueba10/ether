@@ -1,0 +1,131 @@
+package app
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/braedonsaunders/ether/internal/experience"
+	"github.com/braedonsaunders/ether/internal/identity"
+	"github.com/braedonsaunders/ether/internal/mcp"
+	"github.com/braedonsaunders/ether/internal/schedule"
+	"github.com/braedonsaunders/ether/internal/sessions"
+	"github.com/braedonsaunders/ether/internal/store"
+)
+
+// dbMaintenanceInterval is how often derived data is pruned, the SQLite WAL
+// passively checkpointed, the planner statistics refreshed and the database checked for
+// damage. The first pass waits
+// dbMaintenanceDelay so it never competes with startup work.
+const (
+	dbMaintenanceInterval = 24 * time.Hour
+	dbMaintenanceDelay    = 15 * time.Minute
+)
+
+// pruner deletes expired or out-of-retention derived rows for one component
+// and reports how many rows it removed.
+type pruner struct {
+	name  string
+	prune func(context.Context) (int64, error)
+}
+
+// pruners lists every component with a retention policy. User data (plays,
+// watch state, history, playlists, catalogue titles) is never pruned.
+func (a *App) pruners() []pruner {
+	var ps []pruner
+	add := func(name string, ok bool, fn func(context.Context) (int64, error)) {
+		if ok {
+			ps = append(ps, pruner{name, fn})
+		}
+	}
+	add("availability", a.availability != nil, func(ctx context.Context) (int64, error) { return a.availability.Prune(ctx) })
+	add("catalog", a.catalog != nil, func(ctx context.Context) (int64, error) { return a.catalog.Prune(ctx) })
+	add("markers", a.markers != nil, func(ctx context.Context) (int64, error) { return a.markers.Prune(ctx) })
+	add("resolver", a.resolver != nil, func(ctx context.Context) (int64, error) { return a.resolver.Prune(ctx) })
+	add("newznab", a.indexers != nil, func(ctx context.Context) (int64, error) { return a.indexers.Prune(ctx) })
+	add("stats", a.stats != nil, func(ctx context.Context) (int64, error) { return a.stats.Prune(ctx) })
+	add("ratings", a.ratings != nil, func(ctx context.Context) (int64, error) { return a.ratings.Prune(ctx) })
+	add("collections", a.collections != nil, func(ctx context.Context) (int64, error) { return a.collections.Prune(ctx) })
+	add("plexmeta", a.plexMeta != nil, func(ctx context.Context) (int64, error) { return a.plexMeta.Prune(ctx) })
+	add("livetv", a.livetv != nil, func(ctx context.Context) (int64, error) { return a.livetv.Prune(ctx) })
+	add("state_sync", a.state != nil, func(ctx context.Context) (int64, error) { return 0, a.state.CompactSync(ctx, time.Now()) })
+	add("identity", a.db != nil, func(ctx context.Context) (int64, error) {
+		grants, err := identity.NewGrants(a.db, a.users, 30*24*time.Hour, nil)
+		if err != nil {
+			return 0, err
+		}
+		return grants.Prune(ctx)
+	})
+	add("agent", a.agentRT != nil && a.agentRT.svc != nil, func(ctx context.Context) (int64, error) { return a.agentRT.svc.Prune(ctx) })
+	add("plugins", a.pluginsRT != nil && a.pluginsRT.mgr != nil, func(ctx context.Context) (int64, error) { return a.pluginsRT.mgr.Prune(ctx) })
+	add("migrate", a.migration != nil, func(ctx context.Context) (int64, error) { return a.migration.Prune(ctx) })
+	add("debrid", a.debrid != nil, func(ctx context.Context) (int64, error) { return a.debrid.Prune(ctx) })
+	add("experience", a.db != nil, func(ctx context.Context) (int64, error) { return experience.PruneRowViews(ctx, a.db) })
+	add("mcp", a.db != nil, func(ctx context.Context) (int64, error) { return mcp.PruneOAuth(ctx, a.db) })
+	add("sessions", a.frontends != nil && a.frontends.broker != nil, func(ctx context.Context) (int64, error) { return a.frontends.broker.Prune(ctx) })
+	add("sessions_version_ids", a.db != nil, func(ctx context.Context) (int64, error) { return sessions.PruneVersionIDs(ctx, a.db, time.Now()) })
+	add("segcache", a.cache != nil, func(ctx context.Context) (int64, error) { return a.cache.Prune(ctx) })
+	add("watchlist", a.watchlist != nil, func(ctx context.Context) (int64, error) { return a.watchlist.Prune(ctx) })
+	add("notify", a.notifications != nil, func(ctx context.Context) (int64, error) { return a.notifications.Prune(ctx) })
+	add("artwork", a.artwork != nil, func(ctx context.Context) (int64, error) { return a.artwork.Prune(ctx) })
+	add("plex", a.frontends != nil, func(ctx context.Context) (int64, error) { return a.frontends.prune(ctx, "plex") })
+	return ps
+}
+
+// runPruners runs every component prune, logging (not failing on) errors.
+func (a *App) runPruners(ctx context.Context) {
+	for _, p := range a.pruners() {
+		n, err := p.prune(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			a.log.Warn("prune", "component", p.name, "err", err)
+		} else if n > 0 {
+			a.log.Info("pruned stale rows", "component", p.name, "rows", n)
+		}
+	}
+}
+
+// checkpointWAL copies the SQLite WAL from a background goroutine. A commit
+// on a request must not run that checkpoint itself.
+func (a *App) checkpointWAL(ctx context.Context) {
+	if a.db == nil || store.DialectOf(a.db) != store.SQLite {
+		return
+	}
+	store.RunCheckpointer(ctx, a.db, nil, func(err error) {
+		a.log.Warn("wal checkpoint", "err", err)
+	})
+}
+
+// maintainDB prunes derived data and runs store.Maintain daily until ctx
+// ends.
+func (a *App) maintainDB(ctx context.Context) {
+	delay := dbMaintenanceDelay
+	for schedule.Wait(ctx, time.Now, delay) {
+		delay = dbMaintenanceInterval
+		start := time.Now()
+		a.runPruners(ctx)
+		a.maybeAutoCompact(ctx)
+		err := store.Maintain(ctx, a.db)
+		var corrupt *store.CorruptionError
+		switch {
+		case ctx.Err() != nil:
+			return
+		case errors.As(err, &corrupt):
+			// Preserve the finding until a completed owner recheck or the
+			// next daily pass replaces it.
+			a.recordIntegrity(corrupt.Integrity)
+		case store.IsCorrupt(err):
+			a.recordIntegrity(store.Integrity{Findings: []string{err.Error()}, Checked: time.Now().UTC()})
+		case err != nil:
+			a.log.Warn("database maintenance", "err", err)
+			delay = dbMaintenanceDelay
+		default:
+			if store.DialectOf(a.db) != store.Postgres {
+				a.recordIntegrity(store.Integrity{OK: true, Checked: time.Now().UTC()})
+			}
+			a.log.Info("database maintenance done", "took", time.Since(start))
+		}
+	}
+}
